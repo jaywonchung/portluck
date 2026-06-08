@@ -3,6 +3,8 @@
 SSH port-forward to a remote port from the Chrome address bar, tied to a tab's lifetime.
 Type `pf somenode:8888` in your browser address bar and Portluck runs `ssh -N -L 127.0.0.1:8888:127.0.0.1:8888 somenode`, opens `http://localhost:8888`, and tears the tunnel down when you close the tab.
 
+![Portluck demo](assets/demo.gif)
+
 Chrome extensions can't spawn `ssh`, so Portluck is two parts: `extension/` (MV3, owns the omnibox keyword and tab lifecycle) and `native-host/` (a small Rust binary that runs and supervises `ssh`).
 
 ## Prerequisites

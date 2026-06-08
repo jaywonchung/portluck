@@ -9,13 +9,18 @@
     .row a { color: #0d9488; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .row a:hover { text-decoration: underline; }
     button { font: 12px inherit; cursor: pointer; border: 1px solid #ccc; border-radius: 5px; background: #f6f6f6; padding: 3px 8px; }
-    button:hover { background: #eee; }
+    button:hover:not(:disabled) { background: #eee; }
+    button:disabled { color: #aaa; cursor: default; }
     .empty { color: #888; padding: 7px 0; }
+    .footer { margin-top: 8px; padding-top: 8px; border-top: 1px solid #eee; text-align: right; }
   </style>
 </head>
 <body>
   <h1>Portluck tunnels</h1>
   <div id="list"></div>
+  <div class="footer">
+    <button id="clear-history" title="Clear the address-bar history of host:port entries">Clear history</button>
+  </div>
   <script src="popup.js"></script>
 </body>
 </html>

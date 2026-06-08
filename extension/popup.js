@@ -1,4 +1,6 @@
-async function render() {
+const HISTORY_KEY = "history"; // matches background.js
+
+async function renderTunnels() {
   const o = await chrome.storage.session.get("tunnels");
   const m = o.tunnels || {};
   const list = document.getElementById("list");
@@ -33,7 +35,7 @@ async function render() {
     btn.title = "Close the tab and tear down the tunnel";
     btn.addEventListener("click", async function () {
       await chrome.runtime.sendMessage({ type: "closeTunnel", tabId: Number(tabId) });
-      render();
+      renderTunnels();
     });
 
     row.appendChild(a);
@@ -42,4 +44,18 @@ async function render() {
   }
 }
 
-render();
+async function renderHistoryButton() {
+  const o = await chrome.storage.local.get(HISTORY_KEY);
+  const n = (o[HISTORY_KEY] || []).length;
+  const btn = document.getElementById("clear-history");
+  btn.textContent = n ? "Clear history (" + n + ")" : "No history";
+  btn.disabled = n === 0;
+}
+
+document.getElementById("clear-history").addEventListener("click", async function () {
+  await chrome.storage.local.remove(HISTORY_KEY);
+  renderHistoryButton();
+});
+
+renderTunnels();
+renderHistoryButton();

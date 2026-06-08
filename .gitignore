@@ -2,3 +2,5 @@ native-host/target/
 
 # Private key backing the pinned extension ID in extension/manifest.json.
 extension.pem
+
+.DS_Store
