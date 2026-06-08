@@ -1,0 +1,20 @@
+[package]
+name = "portluck-host"
+version = "0.1.0"
+edition = "2021"
+description = "Native messaging host for the Portluck Chrome extension. Runs and supervises ssh port-forwards."
+
+[[bin]]
+name = "portluck-host"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+
+[dependencies]
+openssh = "0.11.6"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "io-util", "time", "sync"] }
