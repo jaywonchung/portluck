@@ -1,23 +1,25 @@
-// Portluck background service worker.
-// Bridges the omnibox and tab lifecycle to a native messaging host that runs ssh.
-//
-// Lifecycle reasoning (Manifest V3):
-//   The native host process lives only as long as our messaging port is open.
-//   When the service worker is suspended, Chrome closes the port and the host
-//   exits, taking its ssh tunnels with it. So while any tunnel is active we keep
-//   the worker awake (an open native port plus a periodic ping). When the last
-//   tunnel goes away we let everything wind down so idle Chrome stays clean.
-//   Because a fresh worker always implies a fresh host with no tunnels, we
-//   reconcile our stored tab->tunnel map against the host's real list on connect.
-
+// Tab records outlive individual SSH attempts and remain until their tabs close.
 const HOST = "com.portluck.host";
 const KEEPALIVE_ALARM = "portluck-keepalive";
-const KEEPALIVE_MS = 20000;
-const START_TIMEOUT_MS = 25000;
+const RETRY_ALARM = "portluck-retry";
+const RETRY_BASE_MS = 30000;
+const RETRY_MAX_MS = 300000;
+// Leave time for the native host's 30-second deadline and process cleanup.
+const START_TIMEOUT_MS = 35000;
+const STOP_TIMEOUT_MS = 5000;
+let connection = null;
+let stateQueue = Promise.resolve();
+const attemptTimers = new Map();
 
-let nativePort = null;
-const pendingStarts = new Map();
-let keepAliveScheduled = false;
+// Serialize storage changes without holding this queue while SSH connects.
+function enqueue(action) {
+  const result = stateQueue.then(action);
+  stateQueue = result.catch(function (error) { log(error); });
+  return result;
+}
+function dispatch(action) {
+  enqueue(action).catch(function (error) { notify("Portluck error", error.message || String(error)); });
+}
 
 function log() {
   console.log.apply(console, ["[portluck]"].concat(Array.prototype.slice.call(arguments)));
@@ -48,26 +50,28 @@ function parseInput(text) {
   return { host: m[1], remotePort: remotePort, localPort: localPort };
 }
 
+
 function getMap() {
   return chrome.storage.session.get("tunnels").then(function (o) { return o.tunnels || {}; });
 }
-function setMap(m) {
-  return chrome.storage.session.set({ tunnels: m });
-}
-async function addTunnel(tabId, info) {
-  const m = await getMap();
-  m[String(tabId)] = info;
-  await setMap(m);
-}
-async function removeTunnel(tabId) {
-  const m = await getMap();
-  if (m[String(tabId)]) {
-    delete m[String(tabId)];
-    await setMap(m);
+async function saveMap(map) {
+  await chrome.storage.session.set({ tunnels: map });
+  const entries = Object.values(map);
+  if (entries.length) {
+    if (!await chrome.alarms.get(KEEPALIVE_ALARM)) {
+      await chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+    }
+  } else {
+    await chrome.alarms.clear(KEEPALIVE_ALARM);
   }
-}
-function clearTunnelMap() {
-  return setMap({});
+  const next = entries.filter(function (info) { return info.nextRetryAt; })
+    .map(function (info) { return info.nextRetryAt; });
+  if (next.length) {
+    await chrome.alarms.create(RETRY_ALARM, { when: Math.min.apply(null, next) });
+  } else {
+    await chrome.alarms.clear(RETRY_ALARM);
+  }
+  if (!entries.length && !attemptTimers.size && connection) connection.port.disconnect();
 }
 
 const HISTORY_KEY = "history";
@@ -115,274 +119,326 @@ async function buildHistorySuggestions(text) {
   });
 }
 
-function getPort() {
-  if (nativePort) return nativePort;
-  const p = chrome.runtime.connectNative(HOST);
-  nativePort = p;
-  p.onMessage.addListener(onHostMessage);
-  p.onDisconnect.addListener(onDisconnect);
-  // Ask the host what it currently holds so we can drop stale map entries.
-  try { p.postMessage({ cmd: "list" }); } catch (e) { /* surfaces via onDisconnect */ }
-  return p;
+function clearAttemptTimer(id) {
+  if (attemptTimers.has(id)) clearTimeout(attemptTimers.get(id));
+  attemptTimers.delete(id);
 }
 
-function onDisconnect() {
-  const err = chrome.runtime.lastError;
-  log("host disconnected", err && err.message);
-  nativePort = null;
-  const reason = err && err.message ? "native host: " + err.message : "native host disconnected";
-  for (const entry of pendingStarts.values()) {
-    clearTimeout(entry.timer);
-    entry.reject(new Error(reason));
-  }
-  pendingStarts.clear();
-  // Host gone means its tunnels are gone, so any tab we track is now dead.
-  clearTunnelMap();
-}
-
-function onHostMessage(msg) {
-  if (!msg || !msg.type) return;
-  if (msg.type === "started") {
-    const pend = pendingStarts.get(msg.id);
-    if (pend) { clearTimeout(pend.timer); pendingStarts.delete(msg.id); pend.resolve(msg); }
-  } else if (msg.type === "error") {
-    const pend = pendingStarts.get(msg.id);
-    if (pend) { clearTimeout(pend.timer); pendingStarts.delete(msg.id); pend.reject(new Error(msg.message || "tunnel failed")); }
-    else notify("Portluck error", msg.message || "tunnel error");
-  } else if (msg.type === "exited") {
-    handleExited(msg);
-  } else if (msg.type === "list") {
-    reconcileToIds(new Set(msg.ids || []));
+function fail(info, message, retryable) {
+  clearAttemptTimer(info.id);
+  info.id = null;
+  info.status = retryable ? "disconnected" : "error";
+  info.lastError = message;
+  info.restartRequested = false;
+  if (retryable) {
+    const delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * Math.pow(2, Math.min(info.retryCount, 4)));
+    info.retryCount += 1;
+    info.nextRetryAt = Date.now() + delay;
+  } else {
+    info.nextRetryAt = null;
   }
 }
 
-function startTunnel(parsed) {
-  const id = crypto.randomUUID();
-  const port = getPort();
-  return new Promise(function (resolve, reject) {
-    const timer = setTimeout(function () {
-      pendingStarts.delete(id);
-      reject(new Error("timed out starting tunnel"));
-    }, START_TIMEOUT_MS);
-    pendingStarts.set(id, { resolve: resolve, reject: reject, timer: timer });
-    try {
-      port.postMessage({ cmd: "start", id: id, host: parsed.host, remotePort: parsed.remotePort, localPort: parsed.localPort });
-    } catch (e) {
-      clearTimeout(timer);
-      pendingStarts.delete(id);
-      reject(e);
-    }
-  }).then(function (started) {
-    return { id: id, localPort: started.localPort };
-  });
-}
-
-function stopTunnel(id) {
-  if (!id) return;
-  try { getPort().postMessage({ cmd: "stop", id: id }); } catch (e) { log("stop failed", e); }
-}
-
-async function getActiveTabId() {
-  try {
-    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    return tabs && tabs[0] ? tabs[0].id : null;
-  } catch (e) {
-    return null;
-  }
-}
-
-async function openTunnel(parsed, disposition) {
-  // The tab the user typed "pf ..." into, captured before any await. On a plain
-  // Enter (disposition "currentTab") Chrome expects us to navigate this tab, not
-  // spawn a second one, so we reuse it as the tunnel's tab.
-  const triggerTabId = await getActiveTabId();
-  const useTrigger = disposition === "currentTab" && triggerTabId != null;
-
-  const m = await getMap();
-  // If a live tab already forwards this host:port, just focus it.
-  for (const tabIdStr of Object.keys(m)) {
-    const info = m[tabIdStr];
-    if (info.host === parsed.host && info.remotePort === parsed.remotePort) {
-      const tabId = Number(tabIdStr);
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        await chrome.tabs.update(tabId, { active: true });
-        if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
-        // The trigger tab was about to be consumed by this navigation anyway, so
-        // drop it rather than leaving it stranded next to the focused tunnel tab.
-        if (useTrigger && triggerTabId !== tabId) {
-          try { await chrome.tabs.remove(triggerTabId); } catch (e) {}
+async function getConnection() {
+  if (connection) return connection.ready;
+  const port = chrome.runtime.connectNative(HOST);
+  const current = { port: port, ready: null, reject: null, handshakeTimer: null };
+  connection = current;
+  current.ready = new Promise(function (resolve, reject) {
+    current.reject = reject;
+    current.handshakeTimer = setTimeout(function () {
+      reject(new Error("Native host did not respond. Rebuild it with scripts/install.sh, then reload Portluck."));
+      port.disconnect();
+    }, 3000);
+    port.onMessage.addListener(function (msg) {
+      if (connection !== current) return;
+      if (msg.type === "ready") {
+        clearTimeout(current.handshakeTimer);
+        if (msg.protocol !== 2) {
+          reject(new Error("Native host version mismatch. Run scripts/install.sh, then reload Portluck."));
+          port.disconnect();
+        } else {
+          resolve(current);
         }
-        return;
-      } catch (e) {
-        stopTunnel(info.id);
-        await removeTunnel(tabId);
+      } else {
+        dispatch(function () { return onHostMessage(current, msg); });
       }
-    }
-  }
-  try {
-    const started = await startTunnel(parsed);
-    const url = "http://localhost:" + started.localPort + "/";
-    let tabId;
-    if (useTrigger) {
-      try {
-        await chrome.tabs.update(triggerTabId, { url: url });
-        tabId = triggerTabId;
-      } catch (e) {
-        // Trigger tab vanished while ssh was connecting; open a fresh one.
-        tabId = (await chrome.tabs.create({ url: url })).id;
-      }
-    } else {
-      tabId = (await chrome.tabs.create({ url: url, active: disposition !== "newBackgroundTab" })).id;
-    }
-    await addTunnel(tabId, {
-      id: started.id,
-      host: parsed.host,
-      remotePort: parsed.remotePort,
-      localPort: started.localPort
     });
-    ensureKeepAlive();
-    log("up", parsed.host + ":" + parsed.remotePort, "on localhost:" + started.localPort, "tab", tabId);
-  } catch (e) {
-    notify("Portluck: could not forward " + parsed.host + ":" + parsed.remotePort, String((e && e.message) || e));
-    log("start failed", e);
+    port.onDisconnect.addListener(function () {
+      const error = chrome.runtime.lastError;
+      const message = error ? error.message : "Native host disconnected";
+      clearTimeout(current.handshakeTimer);
+      reject(new Error(message));
+      dispatch(async function () {
+        if (connection !== current) return;
+        connection = null;
+        const map = await getMap();
+        for (const [key, info] of Object.entries(map)) {
+          if (info.id) {
+            if (info.replacement) map[key] = newRecord(info.replacement);
+            fail(map[key], message, true);
+          }
+        }
+        for (const id of attemptTimers.keys()) clearAttemptTimer(id);
+        await saveMap(map);
+      });
+    });
+  });
+  return current.ready;
+}
+
+async function begin(map, tabId) {
+  const info = map[String(tabId)];
+  if (!info || info.id) return;
+  try { await chrome.tabs.get(tabId); }
+  catch (_) { delete map[String(tabId)]; return; }
+  info.status = "checking";
+  info.nextRetryAt = null;
+  info.lastError = "";
+  await saveMap(map);
+  try {
+    const current = await getConnection();
+    // The tab can close while the native host handshake is pending.
+    try { await chrome.tabs.get(tabId); }
+    catch (_) { delete map[String(tabId)]; return; }
+    const id = crypto.randomUUID();
+    info.id = id;
+    current.port.postMessage({
+      cmd: "start", id: id, host: info.host, remotePort: info.remotePort,
+      localPort: info.localPort, strictLocalPort: info.hasConnected
+    });
+    attemptTimers.set(id, setTimeout(function () {
+      dispatch(async function () {
+        const latest = await getMap();
+        const record = latest[String(tabId)];
+        if (record && record.id === id && ["checking", "connecting"].includes(record.status)) {
+          record.lastError = "SSH startup timed out. Check network or VPN.";
+          await stopAttempt(record, false);
+          await saveMap(latest);
+        }
+      });
+    }, START_TIMEOUT_MS));
+  } catch (error) {
+    fail(info, error.message || String(error), false);
+    notify("Portluck could not connect", info.lastError);
   }
 }
 
-async function handleExited(msg) {
-  const m = await getMap();
-  for (const tabIdStr of Object.keys(m)) {
-    if (m[tabIdStr].id === msg.id) {
-      const info = m[tabIdStr];
-      await removeTunnel(Number(tabIdStr));
-      notify("Portluck: tunnel closed", info.host + ":" + info.remotePort + (msg.message ? " (" + msg.message + ")" : ""));
-      break;
-    }
-  }
-}
-
-async function reconcileToIds(ids) {
-  const m = await getMap();
-  let changed = false;
-  for (const tabIdStr of Object.keys(m)) {
-    if (!ids.has(m[tabIdStr].id)) { delete m[tabIdStr]; changed = true; }
-  }
-  if (changed) await setMap(m);
-}
-
-async function reconcileTabs() {
-  const m = await getMap();
-  let changed = false;
-  for (const tabIdStr of Object.keys(m)) {
-    try {
-      await chrome.tabs.get(Number(tabIdStr));
-    } catch (e) {
-      stopTunnel(m[tabIdStr].id);
-      delete m[tabIdStr];
-      changed = true;
-    }
-  }
-  if (changed) await setMap(m);
-}
-
-function ensureKeepAlive() {
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
-  scheduleKeepAlive();
-}
-function scheduleKeepAlive() {
-  if (keepAliveScheduled) return;
-  keepAliveScheduled = true;
-  setTimeout(tickKeepAlive, KEEPALIVE_MS);
-}
-async function tickKeepAlive() {
-  keepAliveScheduled = false;
-  const m = await getMap();
-  if (Object.keys(m).length === 0) {
-    chrome.alarms.clear(KEEPALIVE_ALARM);
-    if (nativePort) { try { nativePort.disconnect(); } catch (e) {} nativePort = null; }
+async function stopAttempt(info, restart) {
+  info.restartRequested = restart;
+  info.nextRetryAt = null;
+  if (!info.id) return;
+  const id = info.id;
+  clearAttemptTimer(id);
+  info.status = "stopping";
+  if (!connection) {
+    fail(info, "Native host disconnected", true);
     return;
   }
-  try { getPort().postMessage({ cmd: "ping" }); } catch (e) {}
-  scheduleKeepAlive();
+  const current = connection;
+  try { current.port.postMessage({ cmd: "stop", id: id }); }
+  catch (_) { current.port.disconnect(); return; }
+  attemptTimers.set(id, setTimeout(function () {
+    // Closing the messaging port stops all host-owned processes if cancellation stalls.
+    if (connection === current) current.port.disconnect();
+  }, STOP_TIMEOUT_MS));
+}
+
+async function reconnect(tabId, reload) {
+  const map = await getMap();
+  const info = map[String(tabId)];
+  if (!info) throw new Error("This tab has no Portluck tunnel");
+  info.reloadAfterConnect = info.reloadAfterConnect || reload;
+  if (["checking", "connecting", "stopping"].includes(info.status)) {
+    await saveMap(map);
+    return;
+  }
+  info.retryCount = 0;
+  if (info.id) await stopAttempt(info, true);
+  else await begin(map, tabId);
+  await saveMap(map);
+}
+
+async function onHostMessage(current, msg) {
+  if (connection !== current || !msg || !msg.id) return;
+  const map = await getMap();
+  const entry = Object.entries(map).find(function (entry) { return entry[1].id === msg.id; });
+  if (!entry) {
+    if (msg.type === "started") current.port.postMessage({ cmd: "stop", id: msg.id });
+    if (["stopped", "error", "exited"].includes(msg.type)) clearAttemptTimer(msg.id);
+    if (!Object.keys(map).length && !attemptTimers.size) current.port.disconnect();
+    return;
+  }
+  const tabId = Number(entry[0]);
+  const info = entry[1];
+  if (info.status === "stopping" && ["started", "progress"].includes(msg.type)) return;
+  if (msg.type === "progress") {
+    if (!["checking", "connecting"].includes(msg.status)) throw new Error("Invalid native tunnel status");
+    info.status = msg.status;
+  } else if (msg.type === "started") {
+    if (!Number.isInteger(msg.localPort) || msg.localPort < 1 || msg.localPort > 65535
+        || (info.hasConnected && info.localPort !== msg.localPort)) {
+      info.lastError = "Native host returned an incorrect local port";
+      await stopAttempt(info, false);
+    } else {
+      clearAttemptTimer(msg.id);
+      const initial = !info.hasConnected;
+      info.localPort = msg.localPort;
+      info.hasConnected = true;
+      info.status = "connected";
+      info.retryCount = 0;
+      info.nextRetryAt = null;
+      info.lastError = "";
+      try {
+        await chrome.tabs.get(tabId);
+        if (initial) await chrome.tabs.update(tabId, { url: "http://localhost:" + info.localPort + "/" });
+        else if (info.reloadAfterConnect) await chrome.tabs.reload(tabId);
+        info.reloadAfterConnect = false;
+      } catch (_) {
+        await stopAttempt(info, false);
+        delete map[String(tabId)];
+      }
+    }
+  } else if (["error", "exited", "stopped"].includes(msg.type)) {
+    const restart = info.restartRequested;
+    const replacement = info.replacement;
+    const reason = msg.message || info.lastError || "SSH connection closed";
+    if (msg.type === "error" && !info.hasConnected && info.retryCount === 0) {
+      notify("Portluck could not forward " + info.host + ":" + info.remotePort, reason);
+    }
+    fail(info, reason, msg.type !== "error" || msg.retryable === true);
+    if (replacement) {
+      map[String(tabId)] = newRecord(replacement);
+      await begin(map, tabId);
+    } else if (restart) await begin(map, tabId);
+  }
+  await saveMap(map);
+}
+
+async function closeTunnel(tabId, closeTab) {
+  const map = await getMap();
+  const info = map[String(tabId)];
+  if (info) {
+    await stopAttempt(info, false);
+    delete map[String(tabId)];
+    await saveMap(map);
+  }
+  if (closeTab) await chrome.tabs.remove(tabId);
+}
+
+async function maintain() {
+  const map = await getMap();
+  for (const [key, info] of Object.entries(map)) {
+    const tabId = Number(key);
+    try { await chrome.tabs.get(tabId); }
+    catch (_) {
+      await stopAttempt(info, false);
+      delete map[key];
+      continue;
+    }
+    if (!info.id && info.nextRetryAt && info.nextRetryAt <= Date.now()) await begin(map, tabId);
+  }
+  if (connection) {
+    try { connection.port.postMessage({ cmd: "ping" }); }
+    catch (_) { connection.port.disconnect(); }
+  }
+  await saveMap(map);
+  if (!Object.keys(map).length && !attemptTimers.size && connection) connection.port.disconnect();
 }
 
 async function boot() {
-  const m = await getMap();
-  if (Object.keys(m).length > 0) {
-    getPort();          // reconciles our map against the host's real list
-    ensureKeepAlive();
+  const map = await getMap();
+  for (const [key, stored] of Object.entries(map)) {
+    const info = stored.replacement ? newRecord(stored.replacement) : stored;
+    map[key] = info;
+    if (stored.replacement) fail(info, "SSH connection interrupted", true);
+    info.hasConnected = info.hasConnected === undefined ? Boolean(info.localPort) : info.hasConnected;
+    info.retryCount = Number.isInteger(info.retryCount) ? info.retryCount : 0;
+    if (info.id || ["checking", "connecting", "stopping"].includes(info.status) || !info.status) {
+      fail(info, "SSH connection interrupted", true);
+    }
   }
+  await saveMap(map);
+  await maintain();
+}
+
+async function openTunnel(parsed, disposition) {
+  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const triggerTabId = tabs[0] && tabs[0].id;
+  const useTrigger = disposition === "currentTab" && triggerTabId != null;
+  const map = await getMap();
+  for (const [key, info] of Object.entries(map)) {
+    if (info.host !== parsed.host || info.remotePort !== parsed.remotePort
+        || (parsed.localPort !== null && info.localPort !== parsed.localPort)) continue;
+    const tabId = Number(key);
+    let tab;
+    try { tab = await chrome.tabs.get(tabId); }
+    catch (_) {
+      await stopAttempt(info, false);
+      delete map[key];
+      continue;
+    }
+    await saveMap(map);
+    await chrome.tabs.update(tabId, { active: true });
+    if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
+    if (useTrigger && triggerTabId !== tabId) await chrome.tabs.remove(triggerTabId);
+    if (info.status !== "connected") await reconnect(tabId, false);
+    return;
+  }
+  const tabId = useTrigger ? triggerTabId
+    : (await chrome.tabs.create({ active: disposition !== "newBackgroundTab" })).id;
+  const previous = map[String(tabId)];
+  if (previous && previous.id) {
+    previous.replacement = parsed;
+    await stopAttempt(previous, true);
+  } else {
+    map[String(tabId)] = newRecord(parsed);
+    await begin(map, tabId);
+  }
+  await saveMap(map);
+}
+
+function newRecord(parsed) {
+  return {
+    id: null, host: parsed.host, remotePort: parsed.remotePort, localPort: parsed.localPort,
+    hasConnected: false, status: "disconnected", retryCount: 0, nextRetryAt: null,
+    lastError: "", reloadAfterConnect: false, restartRequested: false
+  };
 }
 
 chrome.omnibox.setDefaultSuggestion({
   description: "Forward a remote port over SSH: type host:port (for example somenode:8888)"
 });
-
 chrome.omnibox.onInputChanged.addListener(function (text, suggest) {
   const parsed = parseInput(text);
-  if (parsed) {
-    const lp = parsed.localPort || parsed.remotePort;
-    chrome.omnibox.setDefaultSuggestion({
-      description: "Forward " + xml(parsed.host) + ":" + parsed.remotePort + " to localhost:" + lp + " over SSH, then open it"
-    });
-  } else {
-    chrome.omnibox.setDefaultSuggestion({
-      description: "Type host:port  (for example somenode:8888, or somenode:8888:9000 to choose the local port)"
-    });
-  }
-  buildHistorySuggestions(text).then(suggest);
+  chrome.omnibox.setDefaultSuggestion({ description: parsed
+    ? "Forward " + xml(parsed.host) + ":" + parsed.remotePort + " over SSH"
+    : "Type host:port, or host:remotePort:localPort" });
+  buildHistorySuggestions(text).then(suggest).catch(function (e) { log(e); });
 });
-
 chrome.omnibox.onDeleteSuggestion.addListener(function (content) {
-  removeFromHistory(content);
+  dispatch(function () { return removeFromHistory(content); });
 });
-
 chrome.omnibox.onInputEntered.addListener(function (text, disposition) {
   const parsed = parseInput(text);
-  if (!parsed) {
-    notify("Portluck", "Could not parse \"" + text + "\". Use host:port, for example somenode:8888.");
-    return;
-  }
-  recordHistory(canonical(parsed));
-  openTunnel(parsed, disposition);
+  if (!parsed) { notify("Portluck", "Use host:port or host:remotePort:localPort."); return; }
+  dispatch(async function () {
+    await recordHistory(canonical(parsed));
+    await openTunnel(parsed, disposition);
+  });
 });
-
-chrome.tabs.onRemoved.addListener(async function (tabId) {
-  const m = await getMap();
-  const info = m[String(tabId)];
-  if (!info) return;
-  stopTunnel(info.id);
-  await removeTunnel(tabId);
-  log("tab", tabId, "closed; stopped", info.host + ":" + info.remotePort);
+chrome.tabs.onRemoved.addListener(function (tabId) {
+  dispatch(function () { return closeTunnel(tabId, false); });
 });
-
-chrome.alarms.onAlarm.addListener(async function (a) {
-  if (a.name !== KEEPALIVE_ALARM) return;
-  const m = await getMap();
-  if (Object.keys(m).length === 0) {
-    chrome.alarms.clear(KEEPALIVE_ALARM);
-    if (nativePort) { try { nativePort.disconnect(); } catch (e) {} nativePort = null; }
-    return;
-  }
-  getPort();
-  scheduleKeepAlive();
-  await reconcileTabs();
+chrome.alarms.onAlarm.addListener(function (alarm) {
+  if ([KEEPALIVE_ALARM, RETRY_ALARM].includes(alarm.name)) dispatch(maintain);
 });
-
-chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
-  if (msg && msg.type === "closeTunnel") {
-    (async function () {
-      const m = await getMap();
-      const info = m[String(msg.tabId)];
-      if (info) { stopTunnel(info.id); await removeTunnel(msg.tabId); }
-      try { await chrome.tabs.remove(msg.tabId); } catch (e) {}
-      sendResponse({ ok: true });
-    })();
-    return true;
-  }
+chrome.runtime.onMessage.addListener(function (msg, sender, respond) {
+  if (!msg || !["closeTunnel", "reconnectTunnel"].includes(msg.type)) return;
+  if (!Number.isInteger(msg.tabId)) { respond({ ok: false, error: "Invalid tab" }); return; }
+  enqueue(function () {
+    return msg.type === "closeTunnel" ? closeTunnel(msg.tabId, true) : reconnect(msg.tabId, msg.reload === true);
+  }).then(function () { respond({ ok: true }); }, function (error) { respond({ ok: false, error: error.message }); });
+  return true;
 });
-
-chrome.runtime.onInstalled.addListener(function () { boot(); });
-chrome.runtime.onStartup.addListener(function () { boot(); });
-
-boot();
+dispatch(boot);

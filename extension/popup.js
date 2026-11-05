@@ -1,47 +1,80 @@
-const HISTORY_KEY = "history"; // matches background.js
+const HISTORY_KEY = "history";
+let renderVersion = 0;
+
+async function request(type, tabId, reload) {
+  const response = await chrome.runtime.sendMessage({ type: type, tabId: tabId, reload: reload });
+  if (!response || !response.ok) throw new Error(response ? response.error : "Portluck did not respond");
+}
 
 async function renderTunnels() {
-  const o = await chrome.storage.session.get("tunnels");
-  const m = o.tunnels || {};
+  const version = ++renderVersion;
+  const stored = await chrome.storage.session.get("tunnels");
+  if (version !== renderVersion) return;
+  const entries = Object.entries(stored.tunnels || {});
   const list = document.getElementById("list");
   list.textContent = "";
-
-  const tabIds = Object.keys(m);
-  if (tabIds.length === 0) {
-    const d = document.createElement("div");
-    d.className = "empty";
-    d.textContent = "No active tunnels. Type  pf host:port  in the address bar.";
-    list.appendChild(d);
-    return;
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No tunnels. Type pf host:port in the address bar.";
+    list.appendChild(empty);
   }
-
-  for (const tabId of tabIds) {
-    const info = m[tabId];
+  for (const [key, info] of entries) {
+    const tabId = Number(key);
     const row = document.createElement("div");
     row.className = "row";
-
-    const a = document.createElement("a");
-    a.href = "#";
-    a.title = "Focus tab (localhost:" + info.localPort + ")";
-    a.textContent = info.host + ":" + info.remotePort + "  (localhost:" + info.localPort + ")";
-    a.addEventListener("click", async function (e) {
-      e.preventDefault();
-      try { await chrome.tabs.update(Number(tabId), { active: true }); } catch (_) {}
-      window.close();
+    const link = document.createElement("a");
+    link.href = "#";
+    link.textContent = info.host + ":" + info.remotePort
+      + (info.localPort ? " (localhost:" + info.localPort + ")" : "");
+    link.title = "Focus the owning tab";
+    link.addEventListener("click", async function (event) {
+      event.preventDefault();
+      try {
+        const tab = await chrome.tabs.update(tabId, { active: true });
+        await chrome.windows.update(tab.windowId, { focused: true });
+        window.close();
+      } catch (error) { showError(error.message); }
     });
-
-    const btn = document.createElement("button");
-    btn.textContent = "Close";
-    btn.title = "Close the tab and tear down the tunnel";
-    btn.addEventListener("click", async function () {
-      await chrome.runtime.sendMessage({ type: "closeTunnel", tabId: Number(tabId) });
-      renderTunnels();
-    });
-
-    row.appendChild(a);
-    row.appendChild(btn);
+    const status = document.createElement("div");
+    status.className = "status";
+    const labels = { connected: "Connected", checking: "Checking server reachability...",
+      connecting: "Connecting...", stopping: "Stopping SSH...", disconnected: "Disconnected", error: "Needs attention" };
+    status.textContent = labels[info.status] || "Unknown connection status";
+    if (info.nextRetryAt) status.textContent += ". Retry at " + new Date(info.nextRetryAt).toLocaleTimeString();
+    const error = document.createElement("div");
+    error.className = "error";
+    error.textContent = info.lastError || "";
+    const controls = document.createElement("div");
+    controls.className = "controls";
+    const busy = ["checking", "connecting", "stopping"].includes(info.status);
+    for (const [label, type, reload] of [
+      ["Reconnect", "reconnectTunnel", false],
+      ["Reconnect and reload", "reconnectTunnel", true],
+      ["Close", "closeTunnel", false]
+    ]) {
+      const button = document.createElement("button");
+      button.textContent = label;
+      button.disabled = busy && type !== "closeTunnel";
+      button.title = type === "closeTunnel" ? "Close the owning tab and cancel its tunnel"
+        : reload ? "Reconnect, then reload the owning tab. Unsaved page changes may be lost."
+        : "Reconnect without reloading the owning tab";
+      button.addEventListener("click", async function () {
+        button.disabled = true;
+        try {
+          await request(type, tabId, reload);
+          await renderTunnels();
+        } catch (failure) { showError(failure.message); button.disabled = false; }
+      });
+      controls.appendChild(button);
+    }
+    row.append(link, status, error, controls);
     list.appendChild(row);
   }
+}
+
+function showError(message) {
+  document.getElementById("popup-error").textContent = message;
 }
 
 async function renderHistoryButton() {
@@ -53,9 +86,15 @@ async function renderHistoryButton() {
 }
 
 document.getElementById("clear-history").addEventListener("click", async function () {
-  await chrome.storage.local.remove(HISTORY_KEY);
-  renderHistoryButton();
+  try {
+    await chrome.storage.local.remove(HISTORY_KEY);
+    await renderHistoryButton();
+  } catch (error) { showError(error.message); }
 });
 
-renderTunnels();
-renderHistoryButton();
+chrome.storage.onChanged.addListener(function (changes, area) {
+  if (area === "session" && changes.tunnels) renderTunnels().catch(function (e) { showError(e.message); });
+  if (area === "local" && changes.history) renderHistoryButton().catch(function (e) { showError(e.message); });
+});
+renderTunnels().catch(function (e) { showError(e.message); });
+renderHistoryButton().catch(function (e) { showError(e.message); });

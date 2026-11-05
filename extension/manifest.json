@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "SSH port-forward to a remote server's port straight from the address bar, tied to a tab's lifetime.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu8JAFgxiUwxkxn5ygdMNQShboJKfyXgHVSXh91j11hY5MstlMIaCx4bthyBxu97o+d60z5DheRi39gmpZ9gvWWXoo8RaH67C7Lkkwstl7Tl4WcxIBavxH8i8FPRYN8/W86F5pj3/rmcMEryec27IOOhYayldqGHngSi2oEuK4iefgqgkmueNYOQFapIeb9DF4sn6eJ4x/p6N5oN4Ssh1WYeKbL/fSh/sxQYzhLa+v9lO5gds8WBZM0qLScIyulE0nVbkE1WhruA5lPQ0mLsH2HhVaJYgOFvOWEGZ2Eq0t98MHfiTawTVTiBNCCucbyh2hZ40jWUK+CBoD0a7dTv3lQIDAQAB",
-  "minimum_chrome_version": "116",
+  "minimum_chrome_version": "120",
   "permissions": [
     "nativeMessaging",
     "storage",
